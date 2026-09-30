@@ -60,7 +60,7 @@ git push -u origin main
 2. Go to **Settings** (`⚙`) → **Plugins** (or **Local Scrapers**).
 3. Click **Add Repository URL** (or paste URL):
    ```text
-   https://raw.githubusercontent.com/<YOUR_GITHUB_USERNAME>/nuvio-lookmovie-provider/main/manifest.json
+   https://raw.githubusercontent.com/rajeshprabhu75/nuvio-lookmovie-provider/main/manifest.json
    ```
 4. Click **Install / Add**.
 5. Enable the **LookMovie2** provider toggle.
