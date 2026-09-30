@@ -22,7 +22,8 @@ function normalizeDomain(url) {
     if (!url || typeof url !== "string") return DEFAULT_DOMAIN;
     var d = url.trim();
     if (d.endsWith("/")) d = d.slice(0, -1);
-    if (d === "https://lookmovie2.to" || d === "http://lookmovie2.to") {
+    if (d.startsWith("http://")) d = "https://" + d.slice(7);
+    if (d === "https://lookmovie2.to") {
         d = "https://www.lookmovie2.to";
     }
     return d;
@@ -38,10 +39,12 @@ function getSettings() {
     domain = normalizeDomain(domain);
     var email = (s.email && typeof s.email === "string" && s.email.trim()) ? s.email.trim() : "";
     var password = (s.password && typeof s.password === "string" && s.password.trim()) ? s.password.trim() : "";
+    var cookie = (s.cookie && typeof s.cookie === "string" && s.cookie.trim()) ? s.cookie.trim() : "";
     return {
         domain: domain,
         email: email,
         password: password,
+        cookie: cookie,
         preferredQuality: s.preferredQuality || "All"
     };
 }
@@ -145,7 +148,15 @@ var sessionCache = {
  * Authenticates with LookMovie account to unlock 1080p & 720p streams.
  * Handles initial CSRF session cookie handshake and extracts authenticated PHPSESSID.
  */
-function loginLookMovie(domain, email, password) {
+function loginLookMovie(domain, email, password, customCookie) {
+    if (customCookie) {
+        var cleanCookie = customCookie.replace(/^PHPSESSID=/, "").replace(/;$/, "").trim();
+        if (cleanCookie) {
+            console.log("[LookMovie2] Using user-provided session cookie");
+            return Promise.resolve("PHPSESSID=" + cleanCookie + ";");
+        }
+    }
+
     if (!email || !password) {
         return Promise.resolve("");
     }
@@ -161,7 +172,8 @@ function loginLookMovie(domain, email, password) {
     var headers = {
         "User-Agent": DEFAULT_USER_AGENT,
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Referer": domain + "/"
+        "Referer": domain + "/",
+        "Cache-Control": "no-cache"
     };
 
     return fetch(loginUrl, { headers: headers }).then(function(res) {
@@ -177,7 +189,7 @@ function loginLookMovie(domain, email, password) {
             var csrfTokenMatch = html.match(/name="_csrf"\s+value="([^"]+)"/) || html.match(/name="csrf-token"\s+content="([^"]+)"/);
             var csrf = csrfTokenMatch ? csrfTokenMatch[1] : "";
             if (!csrf) {
-                console.warn("[LookMovie2] CSRF token not found, continuing as guest");
+                console.warn("[LookMovie2] CSRF token not found on " + domain + ", continuing as guest");
                 return "";
             }
 
@@ -200,26 +212,25 @@ function loginLookMovie(domain, email, password) {
             }).then(function(postRes) {
                 var postCookies = postRes.headers.get("set-cookie") || "";
                 var postSessMatch = postCookies.match(/PHPSESSID=([^;]+)/);
-                var finalSessId = postSessMatch ? postSessMatch[1] : (sessMatch ? sessMatch[1] : "");
 
-                if (finalSessId) {
-                    var authCookie = "PHPSESSID=" + finalSessId + ";";
+                if (postRes.status === 302 && postSessMatch) {
+                    var authCookie = "PHPSESSID=" + postSessMatch[1] + ";";
                     sessionCache = {
                         domain: domain,
                         email: email,
                         cookie: authCookie,
                         timestamp: Date.now()
                     };
-                    console.log("[LookMovie2] Authentication successful, 1080p/720p streams unlocked");
+                    console.log("[LookMovie2] Authentication successful on " + domain + ", 1080p/720p unlocked");
                     return authCookie;
                 }
 
-                console.warn("[LookMovie2] Login response did not contain session cookie, continuing as guest");
+                console.warn("[LookMovie2] Login on " + domain + " status: " + postRes.status + ", continuing as guest");
                 return "";
             });
         });
     }).catch(function(err) {
-        console.warn("[LookMovie2] Login failed (" + (err.message || err) + "), continuing as guest");
+        console.warn("[LookMovie2] Login failed on " + domain + " (" + (err.message || err) + "), continuing as guest");
         return "";
     });
 }
@@ -515,24 +526,29 @@ function fetchAccessStreams(domain, storageData, seasonNum, episodeNum, sessionC
 
 /**
  * Attempts scraping across candidate mirrors until streams are found.
+ * If a mirror produces only guest (480p) streams due to login failure, continues trying
+ * subsequent mirrors to find 1080p/720p, falling back to the guest streams if needed.
  */
-function tryScrapeWithMirrors(mirrors, index, meta, seasonNum, episodeNum, settings) {
+function tryScrapeWithMirrors(mirrors, index, meta, seasonNum, episodeNum, settings, guestFallback) {
     if (index >= mirrors.length) {
+        if (guestFallback && guestFallback.length > 0) {
+            console.log("[LookMovie2] Returning guest fallback streams");
+            return Promise.resolve(guestFallback);
+        }
         console.warn("[LookMovie2] All mirrors exhausted for:", meta.title);
         return Promise.resolve([]);
     }
 
     var domain = normalizeDomain(mirrors[index]);
     if (!domain) {
-        return tryScrapeWithMirrors(mirrors, index + 1, meta, seasonNum, episodeNum, settings);
+        return tryScrapeWithMirrors(mirrors, index + 1, meta, seasonNum, episodeNum, settings, guestFallback);
     }
 
     console.log("[LookMovie2] Trying mirror (" + (index + 1) + "/" + mirrors.length + "):", domain);
 
-    return loginLookMovie(domain, settings.email, settings.password).then(function(sessionCookie) {
+    return loginLookMovie(domain, settings.email, settings.password, settings.cookie).then(function(sessionCookie) {
         return searchLookMovie(domain, meta.title, meta.year, meta.mediaType, sessionCookie).then(function(candidate) {
             if (!candidate || !candidate.href) {
-                // If direct title search failed and title starts with "The ", try without "The "
                 if (meta.title && meta.title.toLowerCase().startsWith("the ")) {
                     var stripped = meta.title.slice(4).trim();
                     return searchLookMovie(domain, stripped, meta.year, meta.mediaType, sessionCookie);
@@ -543,7 +559,7 @@ function tryScrapeWithMirrors(mirrors, index, meta, seasonNum, episodeNum, setti
         }).then(function(candidate) {
             if (!candidate || !candidate.href) {
                 console.log("[LookMovie2] No match on mirror " + domain + " for " + meta.title);
-                return tryScrapeWithMirrors(mirrors, index + 1, meta, seasonNum, episodeNum, settings);
+                return tryScrapeWithMirrors(mirrors, index + 1, meta, seasonNum, episodeNum, settings, guestFallback);
             }
 
             var playUrl = candidate.href
@@ -556,14 +572,30 @@ function tryScrapeWithMirrors(mirrors, index, meta, seasonNum, episodeNum, setti
                 return fetchAccessStreams(domain, storage, seasonNum, episodeNum, sessionCookie, playUrl);
             }).then(function(streams) {
                 if (streams && streams.length > 0) {
+                    // Check if high definition streams (1080p or 720p) are present
+                    var hasHd = false;
+                    for (var i = 0; i < streams.length; i++) {
+                        if (streams[i].quality === "1080p" || streams[i].quality === "720p") {
+                            hasHd = true;
+                            break;
+                        }
+                    }
+
+                    if (hasHd || !sessionCookie) {
+                        if (hasHd) return streams;
+                        // If only 480p was returned and we're not authenticated on this mirror,
+                        // remember these streams and try next mirror for HD
+                        if (!guestFallback) guestFallback = streams;
+                        return tryScrapeWithMirrors(mirrors, index + 1, meta, seasonNum, episodeNum, settings, guestFallback);
+                    }
                     return streams;
                 }
-                return tryScrapeWithMirrors(mirrors, index + 1, meta, seasonNum, episodeNum, settings);
+                return tryScrapeWithMirrors(mirrors, index + 1, meta, seasonNum, episodeNum, settings, guestFallback);
             });
         });
     }).catch(function(err) {
         console.warn("[LookMovie2] Mirror " + domain + " failed (" + (err.message || err) + "), trying next...");
-        return tryScrapeWithMirrors(mirrors, index + 1, meta, seasonNum, episodeNum, settings);
+        return tryScrapeWithMirrors(mirrors, index + 1, meta, seasonNum, episodeNum, settings, guestFallback);
     });
 }
 
@@ -593,9 +625,9 @@ function getStreams(tmdbId, mediaType, seasonNum, episodeNum) {
         var mirrorList = [settings.domain];
         var fallbackMirrors = [
             "https://www.lookmovie2.to",
+            "https://lookmovie2.la",
             "https://lookmovie.ag",
-            "https://lookmovie.foundation",
-            "https://lookmovie2.la"
+            "https://lookmovie.foundation"
         ];
         for (var m = 0; m < fallbackMirrors.length; m++) {
             var norm = normalizeDomain(fallbackMirrors[m]);
@@ -604,7 +636,7 @@ function getStreams(tmdbId, mediaType, seasonNum, episodeNum) {
             }
         }
 
-        return tryScrapeWithMirrors(mirrorList, 0, meta, seasonNum, episodeNum, settings);
+        return tryScrapeWithMirrors(mirrorList, 0, meta, seasonNum, episodeNum, settings, null);
     }).catch(function(err) {
         console.error("[LookMovie2] Scraper error:", err && err.message ? err.message : err);
         return [];
@@ -645,6 +677,13 @@ function onSettings() {
             isPassword: true,
             placeholder: "••••••••",
             description: "Your LookMovie password"
+        },
+        {
+            type: "text",
+            key: "cookie",
+            label: "Session Cookie (PHPSESSID)",
+            placeholder: "e.g. 46ge6ted71ufjgqrb1smc4sab6",
+            description: "Optional: Paste your LookMovie PHPSESSID cookie to bypass login forms completely"
         },
         {
             type: "select",
