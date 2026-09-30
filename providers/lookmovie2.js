@@ -703,7 +703,12 @@ function onSettings() {
             type: "select",
             key: "preferredQuality",
             label: "Quality Selection",
-            options: ["All", "1080p", "720p", "480p"],
+            options: [
+                { label: "All Qualities", value: "All" },
+                { label: "1080p Full HD", value: "1080p" },
+                { label: "720p HD", value: "720p" },
+                { label: "480p SD", value: "480p" }
+            ],
             defaultValue: "All",
             description: "Order and filter stream qualities"
         }
