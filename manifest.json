@@ -1,0 +1,28 @@
+{
+  "name": "LookMovie2 Provider Repo",
+  "version": "1.0.0",
+  "scrapers": [
+    {
+      "id": "lookmovie2",
+      "name": "LookMovie2",
+      "description": "Stream movies and TV series directly from LookMovie2 with multiple qualities (1080p, 720p, 480p) and multi-language subtitles.",
+      "version": "1.0.0",
+      "author": "Nuvio Community",
+      "supportedTypes": [
+        "movie",
+        "tv"
+      ],
+      "filename": "providers/lookmovie2.js",
+      "enabled": true,
+      "formats": [
+        "mp4",
+        "mkv",
+        "hls"
+      ],
+      "logo": "https://raw.githubusercontent.com/NuvioMedia/NuvioDesktop/main/assets/brand/app-icon.png",
+      "contentLanguage": [
+        "en"
+      ]
+    }
+  ]
+}
