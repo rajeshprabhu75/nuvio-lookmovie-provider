@@ -11,7 +11,7 @@
  * Complies with Nuvio's Promise-based QuickJS sandbox specification.
  */
 
-var DEFAULT_DOMAIN = "https://lookmovie2.la";
+var DEFAULT_DOMAIN = "https://lookmovie2.to";
 var FALLBACK_TMDB_KEY = "439c478a771f35c05022f9feabcca01c";
 var DEFAULT_USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36";
 
@@ -67,16 +67,42 @@ function requestText(url, options) {
 }
 
 /**
- * Fetches TMDB metadata (Title, Year).
+ * Fetches TMDB metadata (Title, Year), supporting both TMDB numeric IDs and IMDb tt... IDs.
  */
 function getTmdbMetadata(tmdbId, mediaType) {
     var apiKey = (typeof globalThis !== "undefined" && globalThis.TMDB_API_KEY) ? globalThis.TMDB_API_KEY : FALLBACK_TMDB_KEY;
     var type = (mediaType === "tv" || mediaType === "series") ? "tv" : "movie";
-    var url = "https://api.themoviedb.org/3/" + type + "/" + tmdbId + "?api_key=" + apiKey;
+    var idStr = String(tmdbId || "").trim();
+    var isImdb = idStr.startsWith("tt");
+
+    var url;
+    if (isImdb) {
+        url = "https://api.themoviedb.org/3/find/" + encodeURIComponent(idStr) + "?api_key=" + apiKey + "&external_source=imdb_id";
+    } else {
+        url = "https://api.themoviedb.org/3/" + type + "/" + encodeURIComponent(idStr) + "?api_key=" + apiKey;
+    }
 
     return requestJson(url).then(function(data) {
-        var title = data.title || data.name || data.original_title || data.original_name || "";
-        var date = data.release_date || data.first_air_date || "";
+        var item = null;
+        if (isImdb) {
+            if (type === "tv") {
+                item = (data.tv_results && data.tv_results[0]) || (data.tv_episode_results && data.tv_episode_results[0]);
+            } else {
+                item = (data.movie_results && data.movie_results[0]);
+            }
+            if (!item) {
+                item = (data.movie_results && data.movie_results[0]) || (data.tv_results && data.tv_results[0]);
+            }
+        } else {
+            item = data;
+        }
+
+        if (!item) {
+            throw new Error("No metadata returned from TMDB for " + tmdbId);
+        }
+
+        var title = item.title || item.name || item.original_title || item.original_name || "";
+        var date = item.release_date || item.first_air_date || "";
         var year = date ? date.split("-")[0] : "";
         return {
             title: title,
@@ -84,11 +110,11 @@ function getTmdbMetadata(tmdbId, mediaType) {
             mediaType: type
         };
     }).catch(function(err) {
-        console.error("[LookMovie2] TMDB fetch failed:", err);
+        console.error("[LookMovie2] TMDB fetch failed for " + tmdbId + ":", err.message || err);
         return {
             title: "",
             year: "",
-            mediaType: (mediaType === "tv" ? "tv" : "movie")
+            mediaType: type
         };
     });
 }
@@ -232,7 +258,8 @@ function extractStorageFromPage(playUrl, sessionCookie) {
 
     return requestText(playUrl, { headers: headers }).then(function(html) {
         // Check for movie_storage
-        var movieStorageMatch = html.match(/movie_storage"\]\s*=\s*(\{[\s\S]*?\});/);
+        var movieStorageMatch = html.match(/movie_storage['"]\s*\]\s*=\s*(\{[\s\S]*?\n\s*\};)/) ||
+                                html.match(/movie_storage['"]\s*\]\s*=\s*(\{[\s\S]*?\});/);
         if (movieStorageMatch) {
             var raw = movieStorageMatch[1];
             var idMovie = (raw.match(/id_movie\s*:\s*["']?(\d+)["']?/) || [])[1];
@@ -254,7 +281,8 @@ function extractStorageFromPage(playUrl, sessionCookie) {
         }
 
         // Check for show_storage
-        var showStorageMatch = html.match(/show_storage"\]\s*=\s*(\{[\s\S]*?\});/);
+        var showStorageMatch = html.match(/show_storage['"]\s*\]\s*=\s*(\{[\s\S]*?\n\s*\};)/) ||
+                               html.match(/show_storage['"]\s*\]\s*=\s*(\{[\s\S]*?\});/);
         if (showStorageMatch) {
             var showRaw = showStorageMatch[1];
             var sHash = (showRaw.match(/hash\s*:\s*["']([^"']+)["']/) || [])[1];
@@ -423,39 +451,97 @@ function fetchAccessStreams(domain, storageData, seasonNum, episodeNum, sessionC
  * @param {number} [episodeNum] Episode number (for TV series)
  * @returns {Promise<Array<Object>>} Promise resolving to array of stream objects
  */
-function getStreams(tmdbId, mediaType, seasonNum, episodeNum) {
-    var settings = getSettings();
-    var domain = settings.domain;
+/**
+ * Attempts scraping across a list of candidate mirrors until streams are found.
+ */
+function tryScrapeWithMirrors(mirrors, index, meta, seasonNum, episodeNum, settings) {
+    if (index >= mirrors.length) {
+        console.warn("[LookMovie2] All mirrors exhausted for:", meta.title);
+        return Promise.resolve([]);
+    }
 
-    console.log("[LookMovie2] Getting streams for TMDB:", tmdbId, "type:", mediaType, "S:", seasonNum, "E:", episodeNum);
+    var domain = mirrors[index];
+    if (!domain) {
+        return tryScrapeWithMirrors(mirrors, index + 1, meta, seasonNum, episodeNum, settings);
+    }
+
+    console.log("[LookMovie2] Trying mirror (" + (index + 1) + "/" + mirrors.length + "):", domain);
 
     return loginLookMovie(domain, settings.email, settings.password).then(function(sessionCookie) {
-        return getTmdbMetadata(tmdbId, mediaType).then(function(meta) {
-            if (!meta.title) {
-                console.error("[LookMovie2] Could not resolve title from TMDB ID:", tmdbId);
-                return [];
+        return searchLookMovie(domain, meta.title, meta.year, meta.mediaType, sessionCookie).then(function(candidate) {
+            if (!candidate || !candidate.href) {
+                // If direct title search failed and title starts with "The ", try without "The "
+                if (meta.title && meta.title.toLowerCase().startsWith("the ")) {
+                    var stripped = meta.title.slice(4).trim();
+                    return searchLookMovie(domain, stripped, meta.year, meta.mediaType, sessionCookie);
+                }
+                return null;
+            }
+            return candidate;
+        }).then(function(candidate) {
+            if (!candidate || !candidate.href) {
+                console.log("[LookMovie2] No match on mirror " + domain + " for " + meta.title);
+                return tryScrapeWithMirrors(mirrors, index + 1, meta, seasonNum, episodeNum, settings);
             }
 
-            console.log("[LookMovie2] Resolved TMDB media:", meta.title, "(" + meta.year + ")");
+            var playUrl = candidate.href
+                .replace("/movies/view/", "/movies/play/")
+                .replace("/shows/view/", "/shows/play/");
 
-            return searchLookMovie(domain, meta.title, meta.year, meta.mediaType, sessionCookie).then(function(candidate) {
-                if (!candidate || !candidate.href) {
-                    console.log("[LookMovie2] No match found on LookMovie for:", meta.title);
-                    return [];
+            console.log("[LookMovie2] Fetching storage metadata from:", playUrl);
+
+            return extractStorageFromPage(playUrl, sessionCookie).then(function(storage) {
+                return fetchAccessStreams(domain, storage, seasonNum, episodeNum, sessionCookie, playUrl);
+            }).then(function(streams) {
+                if (streams && streams.length > 0) {
+                    return streams;
                 }
-
-                // Switch /view/ to /play/ to access player page
-                var playUrl = candidate.href
-                    .replace("/movies/view/", "/movies/play/")
-                    .replace("/shows/view/", "/shows/play/");
-
-                console.log("[LookMovie2] Fetching storage metadata from:", playUrl);
-
-                return extractStorageFromPage(playUrl, sessionCookie).then(function(storage) {
-                    return fetchAccessStreams(domain, storage, seasonNum, episodeNum, sessionCookie, playUrl);
-                });
+                return tryScrapeWithMirrors(mirrors, index + 1, meta, seasonNum, episodeNum, settings);
             });
         });
+    }).catch(function(err) {
+        console.warn("[LookMovie2] Mirror " + domain + " failed (" + (err.message || err) + "), trying next...");
+        return tryScrapeWithMirrors(mirrors, index + 1, meta, seasonNum, episodeNum, settings);
+    });
+}
+
+/**
+ * Main Nuvio getStreams entry point.
+ * 
+ * @param {string|number} tmdbId TMDB or IMDb ID of the requested media
+ * @param {string} mediaType "movie" or "tv"
+ * @param {number} [seasonNum] Season number (for TV series)
+ * @param {number} [episodeNum] Episode number (for TV series)
+ * @returns {Promise<Array<Object>>} Promise resolving to array of stream objects
+ */
+function getStreams(tmdbId, mediaType, seasonNum, episodeNum) {
+    var settings = getSettings();
+
+    console.log("[LookMovie2] Getting streams for media ID:", tmdbId, "type:", mediaType, "S:", seasonNum, "E:", episodeNum);
+
+    return getTmdbMetadata(tmdbId, mediaType).then(function(meta) {
+        if (!meta.title) {
+            console.error("[LookMovie2] Could not resolve title from media ID:", tmdbId);
+            return [];
+        }
+
+        console.log("[LookMovie2] Resolved media title:", meta.title, "(" + meta.year + ")");
+
+        // Build list of mirrors starting with user-configured domain
+        var mirrorList = [settings.domain];
+        var fallbackMirrors = [
+            "https://lookmovie2.to",
+            "https://lookmovie.ag",
+            "https://lookmovie.foundation",
+            "https://lookmovie2.la"
+        ];
+        for (var m = 0; m < fallbackMirrors.length; m++) {
+            if (mirrorList.indexOf(fallbackMirrors[m]) === -1) {
+                mirrorList.push(fallbackMirrors[m]);
+            }
+        }
+
+        return tryScrapeWithMirrors(mirrorList, 0, meta, seasonNum, episodeNum, settings);
     }).catch(function(err) {
         console.error("[LookMovie2] Scraper error:", err && err.message ? err.message : err);
         return [];
