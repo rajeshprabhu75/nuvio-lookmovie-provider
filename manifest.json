@@ -14,6 +14,7 @@
       ],
       "filename": "providers/lookmovie2.js",
       "enabled": true,
+      "hasSettings": true,
       "formats": [
         "mp4",
         "mkv",
