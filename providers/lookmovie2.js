@@ -178,8 +178,8 @@ function loginLookMovie(domain, email, password, customCookie) {
 
     return fetch(loginUrl, { headers: headers }).then(function(res) {
         var rawCookie = res.headers.get("set-cookie") || "";
-        var sessMatch = rawCookie.match(/PHPSESSID=([^;]+)/);
-        var csrfCookieMatch = rawCookie.match(/_csrf=([^;]+)/);
+        var sessMatch = rawCookie.match(/PHPSESSID=([^;,\s]+)/);
+        var csrfCookieMatch = rawCookie.match(/_csrf=([^;,\s]+)/);
 
         var initialCookies = "";
         if (sessMatch) initialCookies += "PHPSESSID=" + sessMatch[1] + "; ";
@@ -202,6 +202,7 @@ function loginLookMovie(domain, email, password, customCookie) {
                 method: "POST",
                 headers: {
                     "User-Agent": DEFAULT_USER_AGENT,
+                    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
                     "Content-Type": "application/x-www-form-urlencoded",
                     "Referer": loginUrl,
                     "Origin": domain,
@@ -211,18 +212,31 @@ function loginLookMovie(domain, email, password, customCookie) {
                 redirect: "manual"
             }).then(function(postRes) {
                 var postCookies = postRes.headers.get("set-cookie") || "";
-                var postSessMatch = postCookies.match(/PHPSESSID=([^;]+)/);
+                var postSessMatch = postCookies.match(/PHPSESSID=([^;,\s]+)/);
+                var locationHeader = postRes.headers.get("location") || "";
+                var isLoginSuccess = false;
 
-                if (postRes.status === 302 && postSessMatch) {
-                    var authCookie = "PHPSESSID=" + postSessMatch[1] + ";";
-                    sessionCache = {
-                        domain: domain,
-                        email: email,
-                        cookie: authCookie,
-                        timestamp: Date.now()
-                    };
-                    console.log("[LookMovie2] Authentication successful on " + domain + ", 1080p/720p unlocked");
-                    return authCookie;
+                if (postSessMatch && postSessMatch[1]) {
+                    isLoginSuccess = true;
+                } else if ((postRes.status === 302 || postRes.status === 303 || postRes.status === 301) && locationHeader.indexOf("premium") !== -1) {
+                    isLoginSuccess = true;
+                } else if (postRes.url && postRes.url.indexOf("premium") !== -1) {
+                    isLoginSuccess = true;
+                }
+
+                if (isLoginSuccess) {
+                    var finalCookieId = postSessMatch ? postSessMatch[1] : (sessMatch ? sessMatch[1] : "");
+                    if (finalCookieId) {
+                        var authCookie = "PHPSESSID=" + finalCookieId + ";";
+                        sessionCache = {
+                            domain: domain,
+                            email: email,
+                            cookie: authCookie,
+                            timestamp: Date.now()
+                        };
+                        console.log("[LookMovie2] Authentication successful on " + domain + ", 1080p/720p unlocked");
+                        return authCookie;
+                    }
                 }
 
                 console.warn("[LookMovie2] Login on " + domain + " status: " + postRes.status + ", continuing as guest");
