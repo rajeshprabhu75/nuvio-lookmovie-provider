@@ -31,7 +31,7 @@ function normalizeDomain(url) {
 
 /**
  * Returns user-configured settings or defaults.
- * Built-in default credentials ensure 1080p/720p streams work immediately.
+ * Credentials and cookies are configured securely via Nuvio plugin settings.
  */
 function getSettings() {
     var s = (typeof globalThis !== "undefined" && globalThis.SCRAPER_SETTINGS) ? globalThis.SCRAPER_SETTINGS : {};
