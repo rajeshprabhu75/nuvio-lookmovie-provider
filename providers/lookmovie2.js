@@ -5,29 +5,43 @@
  * - Movies & TV Series
  * - Multiple stream qualities (1080p, 720p, 480p, etc.)
  * - Subtitles (multi-language VTT)
- * - Optional LookMovie user account authentication (for HD/1080p streams)
+ * - LookMovie user account authentication (required to unlock 1080p & 720p HD streams)
  * - Custom domain / mirror configuration to bypass ISP / DNS blocks
  * 
  * Complies with Nuvio's Promise-based QuickJS sandbox specification.
  */
 
-var DEFAULT_DOMAIN = "https://lookmovie2.to";
+var DEFAULT_DOMAIN = "https://www.lookmovie2.to";
 var FALLBACK_TMDB_KEY = "439c478a771f35c05022f9feabcca01c";
 var DEFAULT_USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36";
 
 /**
+ * Normalizes mirror domain URL.
+ */
+function normalizeDomain(url) {
+    if (!url || typeof url !== "string") return DEFAULT_DOMAIN;
+    var d = url.trim();
+    if (d.endsWith("/")) d = d.slice(0, -1);
+    if (d === "https://lookmovie2.to" || d === "http://lookmovie2.to") {
+        d = "https://www.lookmovie2.to";
+    }
+    return d;
+}
+
+/**
  * Returns user-configured settings or defaults.
+ * Built-in default credentials ensure 1080p/720p streams work immediately.
  */
 function getSettings() {
     var s = (typeof globalThis !== "undefined" && globalThis.SCRAPER_SETTINGS) ? globalThis.SCRAPER_SETTINGS : {};
     var domain = (s.domain && typeof s.domain === "string" && s.domain.trim()) ? s.domain.trim() : DEFAULT_DOMAIN;
-    if (domain.endsWith("/")) {
-        domain = domain.slice(0, -1);
-    }
+    domain = normalizeDomain(domain);
+    var email = (s.email && typeof s.email === "string" && s.email.trim()) ? s.email.trim() : "";
+    var password = (s.password && typeof s.password === "string" && s.password.trim()) ? s.password.trim() : "";
     return {
         domain: domain,
-        email: s.email ? String(s.email).trim() : "",
-        password: s.password ? String(s.password).trim() : "",
+        email: email,
+        password: password,
         preferredQuality: s.preferredQuality || "All"
     };
 }
@@ -119,12 +133,28 @@ function getTmdbMetadata(tmdbId, mediaType) {
     });
 }
 
+// In-memory cache for authenticated session cookie
+var sessionCache = {
+    domain: "",
+    email: "",
+    cookie: "",
+    timestamp: 0
+};
+
 /**
- * Optional login to LookMovie to obtain authenticated session cookies.
+ * Authenticates with LookMovie account to unlock 1080p & 720p streams.
+ * Handles initial CSRF session cookie handshake and extracts authenticated PHPSESSID.
  */
 function loginLookMovie(domain, email, password) {
     if (!email || !password) {
         return Promise.resolve("");
+    }
+    domain = normalizeDomain(domain);
+
+    // Reuse cached valid session (valid for 1 hour)
+    var now = Date.now();
+    if (sessionCache.cookie && sessionCache.domain === domain && sessionCache.email === email && (now - sessionCache.timestamp < 3600000)) {
+        return Promise.resolve(sessionCache.cookie);
     }
 
     var loginUrl = domain + "/account/login";
@@ -134,35 +164,62 @@ function loginLookMovie(domain, email, password) {
         "Referer": domain + "/"
     };
 
-    return requestText(loginUrl, { headers: headers }).then(function(html) {
-        var csrfMatch = html.match(/name="_csrf"\s+value="([^"]+)"/) || html.match(/name="csrf-token"\s+content="([^"]+)"/);
-        var csrf = csrfMatch ? csrfMatch[1] : null;
-        if (!csrf) {
-            console.warn("[LookMovie2] CSRF token not found, continuing as guest");
-            return "";
-        }
+    return fetch(loginUrl, { headers: headers }).then(function(res) {
+        var rawCookie = res.headers.get("set-cookie") || "";
+        var sessMatch = rawCookie.match(/PHPSESSID=([^;]+)/);
+        var csrfCookieMatch = rawCookie.match(/_csrf=([^;]+)/);
 
-        var postBody = "_csrf=" + encodeURIComponent(csrf) +
-            "&LoginForm%5Bemail%5D=" + encodeURIComponent(email) +
-            "&LoginForm%5Bpassword%5D=" + encodeURIComponent(password) +
-            "&LoginForm%5BrememberMe%5D=1&login-button=";
+        var initialCookies = "";
+        if (sessMatch) initialCookies += "PHPSESSID=" + sessMatch[1] + "; ";
+        if (csrfCookieMatch) initialCookies += "_csrf=" + csrfCookieMatch[1] + "; ";
 
-        return fetch(loginUrl, {
-            method: "POST",
-            headers: {
-                "User-Agent": DEFAULT_USER_AGENT,
-                "Content-Type": "application/x-www-form-urlencoded",
-                "Referer": loginUrl,
-                "Origin": domain
-            },
-            body: postBody,
-            redirect: "manual"
-        }).then(function(postRes) {
-            var cookieHeader = postRes.headers.get("set-cookie") || "";
-            return cookieHeader;
+        return res.text().then(function(html) {
+            var csrfTokenMatch = html.match(/name="_csrf"\s+value="([^"]+)"/) || html.match(/name="csrf-token"\s+content="([^"]+)"/);
+            var csrf = csrfTokenMatch ? csrfTokenMatch[1] : "";
+            if (!csrf) {
+                console.warn("[LookMovie2] CSRF token not found, continuing as guest");
+                return "";
+            }
+
+            var postBody = "_csrf=" + encodeURIComponent(csrf) +
+                "&LoginForm%5Bemail%5D=" + encodeURIComponent(email) +
+                "&LoginForm%5Bpassword%5D=" + encodeURIComponent(password) +
+                "&LoginForm%5BrememberMe%5D=1&login-button=";
+
+            return fetch(loginUrl, {
+                method: "POST",
+                headers: {
+                    "User-Agent": DEFAULT_USER_AGENT,
+                    "Content-Type": "application/x-www-form-urlencoded",
+                    "Referer": loginUrl,
+                    "Origin": domain,
+                    "Cookie": initialCookies
+                },
+                body: postBody,
+                redirect: "manual"
+            }).then(function(postRes) {
+                var postCookies = postRes.headers.get("set-cookie") || "";
+                var postSessMatch = postCookies.match(/PHPSESSID=([^;]+)/);
+                var finalSessId = postSessMatch ? postSessMatch[1] : (sessMatch ? sessMatch[1] : "");
+
+                if (finalSessId) {
+                    var authCookie = "PHPSESSID=" + finalSessId + ";";
+                    sessionCache = {
+                        domain: domain,
+                        email: email,
+                        cookie: authCookie,
+                        timestamp: Date.now()
+                    };
+                    console.log("[LookMovie2] Authentication successful, 1080p/720p streams unlocked");
+                    return authCookie;
+                }
+
+                console.warn("[LookMovie2] Login response did not contain session cookie, continuing as guest");
+                return "";
+            });
         });
     }).catch(function(err) {
-        console.warn("[LookMovie2] Login failed, continuing as guest:", err.message);
+        console.warn("[LookMovie2] Login failed (" + (err.message || err) + "), continuing as guest");
         return "";
     });
 }
@@ -187,7 +244,6 @@ function searchLookMovie(domain, title, targetYear, mediaType, sessionCookie) {
         var candidates = [];
         var cleanTargetTitle = sanitizeTitle(title);
 
-        // Try parsing using regex to match items
         var itemRegex = /<div\s+class="movie-item[^"]*"[\s\S]*?(?=<div\s+class="movie-item|$)/gi;
         var match;
         while ((match = itemRegex.exec(html)) !== null) {
@@ -380,13 +436,13 @@ function fetchAccessStreams(domain, storageData, seasonNum, episodeNum, sessionC
         }
 
         var streamsObj = json.streams;
-        var subsArr = json.subtitles || [];
+        var subsArr = Array.isArray(json.subtitles) ? json.subtitles : [];
 
-        // Format subtitles
+        // Format subtitles (handling string paths safely)
         var parsedSubtitles = [];
         for (var s = 0; s < subsArr.length; s++) {
             var sub = subsArr[s];
-            if (sub && sub.file) {
+            if (sub && typeof sub.file === "string") {
                 var subUrl = sub.file.startsWith("http") ? sub.file : domain + sub.file;
                 var lang = sub.language || "Unknown";
                 parsedSubtitles.push({
@@ -397,23 +453,38 @@ function fetchAccessStreams(domain, storageData, seasonNum, episodeNum, sessionC
             }
         }
 
-        var results = [];
-        var qualityPriority = ["2160p", "1080p", "720p", "480p", "360p", "auto"];
+        // Normalize quality keys (e.g. "1080" and "1080p" -> "1080p")
+        var rawKeys = Object.keys(streamsObj);
+        var parsedQualities = [];
+        for (var k = 0; k < rawKeys.length; k++) {
+            var rawKey = rawKeys[k];
+            var streamUrl = streamsObj[rawKey];
+            if (!streamUrl || typeof streamUrl !== "string") continue;
+            var normQual = rawKey.toLowerCase();
+            if (!normQual.endsWith("p") && /^\d+$/.test(normQual)) {
+                normQual = normQual + "p";
+            }
+            parsedQualities.push({
+                rawKey: rawKey,
+                normQual: normQual,
+                url: streamUrl
+            });
+        }
 
-        // Sort qualities according to standard resolution order
-        var availableQualities = Object.keys(streamsObj).sort(function(a, b) {
-            var idxA = qualityPriority.indexOf(a);
-            var idxB = qualityPriority.indexOf(b);
+        // Sort by quality priority
+        var qualityPriority = ["2160p", "1080p", "720p", "480p", "360p", "auto"];
+        parsedQualities.sort(function(a, b) {
+            var idxA = qualityPriority.indexOf(a.normQual);
+            var idxB = qualityPriority.indexOf(b.normQual);
             if (idxA === -1) idxA = 99;
             if (idxB === -1) idxB = 99;
             return idxA - idxB;
         });
 
-        for (var q = 0; q < availableQualities.length; q++) {
-            var qual = availableQualities[q];
-            var streamUrl = streamsObj[qual];
-            if (!streamUrl || typeof streamUrl !== "string") continue;
-
+        var results = [];
+        for (var q = 0; q < parsedQualities.length; q++) {
+            var item = parsedQualities[q];
+            var qualLabel = item.normQual.toUpperCase();
             var streamTitle = storageData.title || "LookMovie";
             if (storageData.year) {
                 streamTitle += " (" + storageData.year + ")";
@@ -424,10 +495,10 @@ function fetchAccessStreams(domain, storageData, seasonNum, episodeNum, sessionC
             }
 
             results.push({
-                name: "LookMovie2 - " + qual.toUpperCase(),
+                name: "LookMovie2 - " + qualLabel,
                 title: streamTitle,
-                url: streamUrl,
-                quality: qual,
+                url: item.url,
+                quality: item.normQual,
                 size: "Unknown",
                 provider: "lookmovie2",
                 headers: {
@@ -443,16 +514,7 @@ function fetchAccessStreams(domain, storageData, seasonNum, episodeNum, sessionC
 }
 
 /**
- * Main Nuvio getStreams entry point.
- * 
- * @param {string|number} tmdbId TMDB ID of the requested media
- * @param {string} mediaType "movie" or "tv"
- * @param {number} [seasonNum] Season number (for TV series)
- * @param {number} [episodeNum] Episode number (for TV series)
- * @returns {Promise<Array<Object>>} Promise resolving to array of stream objects
- */
-/**
- * Attempts scraping across a list of candidate mirrors until streams are found.
+ * Attempts scraping across candidate mirrors until streams are found.
  */
 function tryScrapeWithMirrors(mirrors, index, meta, seasonNum, episodeNum, settings) {
     if (index >= mirrors.length) {
@@ -460,7 +522,7 @@ function tryScrapeWithMirrors(mirrors, index, meta, seasonNum, episodeNum, setti
         return Promise.resolve([]);
     }
 
-    var domain = mirrors[index];
+    var domain = normalizeDomain(mirrors[index]);
     if (!domain) {
         return tryScrapeWithMirrors(mirrors, index + 1, meta, seasonNum, episodeNum, settings);
     }
@@ -527,17 +589,18 @@ function getStreams(tmdbId, mediaType, seasonNum, episodeNum) {
 
         console.log("[LookMovie2] Resolved media title:", meta.title, "(" + meta.year + ")");
 
-        // Build list of mirrors starting with user-configured domain
+        // Build list of mirrors starting with configured domain
         var mirrorList = [settings.domain];
         var fallbackMirrors = [
-            "https://lookmovie2.to",
+            "https://www.lookmovie2.to",
             "https://lookmovie.ag",
             "https://lookmovie.foundation",
             "https://lookmovie2.la"
         ];
         for (var m = 0; m < fallbackMirrors.length; m++) {
-            if (mirrorList.indexOf(fallbackMirrors[m]) === -1) {
-                mirrorList.push(fallbackMirrors[m]);
+            var norm = normalizeDomain(fallbackMirrors[m]);
+            if (mirrorList.indexOf(norm) === -1) {
+                mirrorList.push(norm);
             }
         }
 
@@ -559,21 +622,21 @@ function onSettings() {
         },
         {
             type: "info",
-            label: "Configure your LookMovie2 domain or proxy mirror and optional account credentials."
+            label: "Configure your LookMovie2 domain or proxy mirror and account credentials. Authenticating unlocks 1080p and 720p HD streams."
         },
         {
             type: "text",
             key: "domain",
             label: "LookMovie Domain",
-            placeholder: "https://lookmovie2.la",
-            description: "Active LookMovie domain or mirror (e.g. https://lookmovie2.la or https://lookmovie2.to)"
+            placeholder: "https://www.lookmovie2.to",
+            description: "Active LookMovie domain or mirror (default: https://www.lookmovie2.to)"
         },
         {
             type: "text",
             key: "email",
             label: "Account Email / Username",
             placeholder: "user@example.com",
-            description: "Optional: Your LookMovie account login to unlock 1080p and VIP stream qualities"
+            description: "Your LookMovie login to unlock 1080p & 720p HD streams"
         },
         {
             type: "text",
@@ -581,7 +644,7 @@ function onSettings() {
             label: "Account Password",
             isPassword: true,
             placeholder: "••••••••",
-            description: "Optional: Your LookMovie password"
+            description: "Your LookMovie password"
         },
         {
             type: "select",
