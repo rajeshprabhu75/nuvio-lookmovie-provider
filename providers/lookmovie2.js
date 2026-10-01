@@ -5,15 +5,28 @@
  * - Movies & TV Series
  * - Multiple stream qualities (1080p, 720p, 480p, etc.)
  * - Subtitles (multi-language VTT)
- * - LookMovie user account authentication (required to unlock 1080p & 720p HD streams)
+ * - LookMovie user account authentication (unlocks 1080p & 720p HD streams)
+ * - Real-time diagnostics: mirror domain connected, auth status, login failure reasons
  * - Custom domain / mirror configuration to bypass ISP / DNS blocks
  * 
  * Complies with Nuvio's Promise-based QuickJS sandbox specification.
  */
 
-var DEFAULT_DOMAIN = "https://www.lookmovie2.to";
+var DEFAULT_DOMAIN = "https://lookmovie2.la";
 var FALLBACK_TMDB_KEY = "439c478a771f35c05022f9feabcca01c";
 var DEFAULT_USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36";
+
+/**
+ * On Android TV, Nuvio's TV interface does not have a provider settings/gear icon.
+ * For private builds (e.g. your private GitHub Secret Gist), you can optionally
+ * fill in your credentials below so your Android TV automatically authenticates.
+ * In public repositories, keep these strings empty ("").
+ */
+var TV_FALLBACK_CREDENTIALS = {
+    email: "",      // e.g. "your_email@example.com"
+    password: "",   // e.g. "your_password"
+    cookie: ""      // e.g. "PHPSESSID=46ge6ted71ufjgqrb1smc4sab6" (bypasses login and CAPTCHAs)
+};
 
 /**
  * Normalizes mirror domain URL.
@@ -30,16 +43,63 @@ function normalizeDomain(url) {
 }
 
 /**
+ * Extracts hostname from URL for compact UI badge display.
+ */
+function getHostName(url) {
+    try {
+        var m = String(url || "").match(/^https?:\/\/([^/?#]+)/i);
+        if (m && m[1]) {
+            return m[1].replace(/^www\./, "");
+        }
+        return url || "lookmovie";
+    } catch (e) {
+        return url || "lookmovie";
+    }
+}
+
+/**
+ * Masks email address for secure diagnostic logging in UI (e.g. u***3@example.com).
+ */
+function maskEmail(email) {
+    if (!email || typeof email !== "string" || email.length < 4) return "****";
+    var parts = email.split("@");
+    if (parts.length === 2) {
+        var u = parts[0];
+        var d = parts[1];
+        var masked = u.length > 2 ? u[0] + "***" + u[u.length - 1] : u[0] + "***";
+        return masked + "@" + d;
+    }
+    return email[0] + "***" + email[email.length - 1];
+}
+
+/**
+ * Creates a diagnostics tracker for the current scraper execution.
+ */
+function createDiagnosticState() {
+    return {
+        activeMirror: "",
+        triedMirrors: [],
+        authType: "none",            // "cookie" | "credentials" | "none"
+        authStatus: "UNKNOWN",       // "SUCCESS" | "GUEST_NO_CREDS" | "BAD_CREDS" | "CAPTCHA" | "HTTP_ERROR" | "COOKIE_ACTIVE" | "NETWORK_ERROR"
+        authMessage: "Checking status...",
+        storageFound: false,
+        qualitiesFound: []
+    };
+}
+
+/**
  * Returns user-configured settings or defaults.
- * Credentials and cookies are configured securely via Nuvio plugin settings.
+ * Falls back to TV_FALLBACK_CREDENTIALS for Android TV environments.
  */
 function getSettings() {
     var s = (typeof globalThis !== "undefined" && globalThis.SCRAPER_SETTINGS) ? globalThis.SCRAPER_SETTINGS : {};
     var domain = (s.domain && typeof s.domain === "string" && s.domain.trim()) ? s.domain.trim() : DEFAULT_DOMAIN;
     domain = normalizeDomain(domain);
-    var email = (s.email && typeof s.email === "string" && s.email.trim()) ? s.email.trim() : "";
-    var password = (s.password && typeof s.password === "string" && s.password.trim()) ? s.password.trim() : "";
-    var cookie = (s.cookie && typeof s.cookie === "string" && s.cookie.trim()) ? s.cookie.trim() : "";
+
+    var email = (s.email && typeof s.email === "string" && s.email.trim()) ? s.email.trim() : (TV_FALLBACK_CREDENTIALS.email || "");
+    var password = (s.password && typeof s.password === "string" && s.password.trim()) ? s.password.trim() : (TV_FALLBACK_CREDENTIALS.password || "");
+    var cookie = (s.cookie && typeof s.cookie === "string" && s.cookie.trim()) ? s.cookie.trim() : (TV_FALLBACK_CREDENTIALS.cookie || "");
+
     return {
         domain: domain,
         email: email,
@@ -146,25 +206,45 @@ var sessionCache = {
 
 /**
  * Authenticates with LookMovie account to unlock 1080p & 720p streams.
- * Handles initial CSRF session cookie handshake and extracts authenticated PHPSESSID.
+ * Records precise diagnostic status and reasons (bad credentials, CAPTCHA, etc.).
  */
-function loginLookMovie(domain, email, password, customCookie) {
+function loginLookMovie(domain, email, password, customCookie, diag) {
     if (customCookie) {
         var cleanCookie = customCookie.replace(/^PHPSESSID=/, "").replace(/;$/, "").trim();
         if (cleanCookie) {
-            console.log("[LookMovie2] Using user-provided session cookie");
+            console.log("[LookMovie2 Diagnostics] Using user-provided session cookie");
+            if (diag) {
+                diag.authType = "cookie";
+                diag.authStatus = "COOKIE_ACTIVE";
+                diag.authMessage = "Using custom session cookie (PHPSESSID)";
+            }
             return Promise.resolve("PHPSESSID=" + cleanCookie + ";");
         }
     }
 
     if (!email || !password) {
+        console.log("[LookMovie2 Diagnostics] No login credentials configured, continuing in Guest mode (480p SD only)");
+        if (diag) {
+            diag.authType = "none";
+            diag.authStatus = "GUEST_NO_CREDS";
+            diag.authMessage = "Guest Mode: No credentials configured (HD 1080p/720p locked by source)";
+        }
         return Promise.resolve("");
+    }
+
+    if (diag) {
+        diag.authType = "credentials";
     }
     domain = normalizeDomain(domain);
 
     // Reuse cached valid session (valid for 1 hour)
     var now = Date.now();
     if (sessionCache.cookie && sessionCache.domain === domain && sessionCache.email === email && (now - sessionCache.timestamp < 3600000)) {
+        console.log("[LookMovie2 Diagnostics] Reusing active cached login session");
+        if (diag) {
+            diag.authStatus = "SUCCESS";
+            diag.authMessage = "Logged In: Active session (" + maskEmail(email) + ")";
+        }
         return Promise.resolve(sessionCache.cookie);
     }
 
@@ -176,7 +256,18 @@ function loginLookMovie(domain, email, password, customCookie) {
         "Cache-Control": "no-cache"
     };
 
+    console.log("[LookMovie2 Diagnostics] Initiating login handshake on " + domain + " for " + maskEmail(email));
+
     return fetch(loginUrl, { headers: headers }).then(function(res) {
+        if (res.status === 403 || res.status === 503) {
+            if (diag) {
+                diag.authStatus = "HTTP_ERROR";
+                diag.authMessage = "Login failed: HTTP " + res.status + " (Cloudflare block on " + domain + ")";
+            }
+            console.warn("[LookMovie2 Diagnostics] Login page blocked by Cloudflare (HTTP " + res.status + ")");
+            return "";
+        }
+
         var rawCookie = res.headers.get("set-cookie") || "";
         var sessMatch = rawCookie.match(/PHPSESSID=([^;,\s]+)/);
         var csrfCookieMatch = rawCookie.match(/_csrf=([^;,\s]+)/);
@@ -189,7 +280,11 @@ function loginLookMovie(domain, email, password, customCookie) {
             var csrfTokenMatch = html.match(/name="_csrf"\s+value="([^"]+)"/) || html.match(/name="csrf-token"\s+content="([^"]+)"/);
             var csrf = csrfTokenMatch ? csrfTokenMatch[1] : "";
             if (!csrf) {
-                console.warn("[LookMovie2] CSRF token not found on " + domain + ", continuing as guest");
+                console.warn("[LookMovie2 Diagnostics] CSRF token not found on " + domain + ", continuing as guest");
+                if (diag) {
+                    diag.authStatus = "NO_CSRF";
+                    diag.authMessage = "Login failed: CSRF token not found on " + domain;
+                }
                 return "";
             }
 
@@ -214,13 +309,13 @@ function loginLookMovie(domain, email, password, customCookie) {
                 var postCookies = postRes.headers.get("set-cookie") || "";
                 var postSessMatch = postCookies.match(/PHPSESSID=([^;,\s]+)/);
                 var locationHeader = postRes.headers.get("location") || "";
+                var finalUrl = postRes.url || "";
                 var isLoginSuccess = false;
 
-                if (postSessMatch && postSessMatch[1]) {
+                var isRedirect = (postRes.status === 301 || postRes.status === 302 || postRes.status === 303);
+                if (isRedirect && locationHeader && locationHeader.indexOf("/account/login") === -1) {
                     isLoginSuccess = true;
-                } else if ((postRes.status === 302 || postRes.status === 303 || postRes.status === 301) && locationHeader.indexOf("premium") !== -1) {
-                    isLoginSuccess = true;
-                } else if (postRes.url && postRes.url.indexOf("premium") !== -1) {
+                } else if (!isRedirect && finalUrl && finalUrl.indexOf("/account/login") === -1 && (finalUrl.indexOf("/premium") !== -1 || finalUrl.endsWith("/"))) {
                     isLoginSuccess = true;
                 }
 
@@ -234,17 +329,54 @@ function loginLookMovie(domain, email, password, customCookie) {
                             cookie: authCookie,
                             timestamp: Date.now()
                         };
-                        console.log("[LookMovie2] Authentication successful on " + domain + ", 1080p/720p unlocked");
+                        console.log("[LookMovie2 Diagnostics] Login successful on " + domain + "! HD 1080p/720p unlocked");
+                        if (diag) {
+                            diag.authStatus = "SUCCESS";
+                            diag.authMessage = "Logged In: HD unlocked (" + maskEmail(email) + ")";
+                        }
                         return authCookie;
                     }
                 }
 
-                console.warn("[LookMovie2] Login on " + domain + " status: " + postRes.status + ", continuing as guest");
-                return "";
+                // Status 200 or unhandled redirect on /account/login is a failed login.
+                // Analyze failure response HTML to provide exact diagnostics:
+                return postRes.text().then(function(postHtml) {
+                    var lowerHtml = postHtml.toLowerCase();
+                    if (lowerHtml.indexOf("incorrect email or password") !== -1 || lowerHtml.indexOf("incorrect username or password") !== -1) {
+                        console.warn("[LookMovie2 Diagnostics] Login failed: Incorrect email or password on " + domain);
+                        if (diag) {
+                            diag.authStatus = "BAD_CREDS";
+                            diag.authMessage = "Login failed: Incorrect email or password";
+                        }
+                    } else if (lowerHtml.indexOf("recaptcha") !== -1 || lowerHtml.indexOf("g-recaptcha") !== -1 || lowerHtml.indexOf("captcha") !== -1) {
+                        console.warn("[LookMovie2 Diagnostics] Login failed: reCAPTCHA bot challenge triggered on " + domain);
+                        if (diag) {
+                            diag.authStatus = "CAPTCHA";
+                            diag.authMessage = "Login failed: reCAPTCHA challenge (Use browser PHPSESSID cookie to bypass)";
+                        }
+                    } else if (postRes.status === 403 || postRes.status === 429) {
+                        console.warn("[LookMovie2 Diagnostics] Login failed: HTTP " + postRes.status + " rate limited or blocked");
+                        if (diag) {
+                            diag.authStatus = "HTTP_ERROR";
+                            diag.authMessage = "Login failed: HTTP " + postRes.status + " (Rate limited/blocked)";
+                        }
+                    } else {
+                        console.warn("[LookMovie2 Diagnostics] Login failed: Server returned HTTP " + postRes.status);
+                        if (diag) {
+                            diag.authStatus = "FAILED";
+                            diag.authMessage = "Login failed: Server rejected request (Status " + postRes.status + ")";
+                        }
+                    }
+                    return "";
+                });
             });
         });
     }).catch(function(err) {
-        console.warn("[LookMovie2] Login failed on " + domain + " (" + (err.message || err) + "), continuing as guest");
+        console.warn("[LookMovie2 Diagnostics] Login network error on " + domain + ": " + (err.message || err));
+        if (diag) {
+            diag.authStatus = "NETWORK_ERROR";
+            diag.authMessage = "Login network error: " + (err.message || err);
+        }
         return "";
     });
 }
@@ -306,7 +438,7 @@ function searchLookMovie(domain, title, targetYear, mediaType, sessionCookie) {
 
             if (cleanCandidateTitle === cleanTargetTitle) {
                 score += 10;
-            } else if (cleanCandidateTitle.includes(cleanTargetTitle) || cleanTargetTitle.includes(cleanCandidateTitle)) {
+            } else if (cleanCandidateTitle.indexOf(cleanTargetTitle) !== -1 || cleanTargetTitle.indexOf(cleanCandidateTitle) !== -1) {
                 score += 5;
             }
 
@@ -407,9 +539,35 @@ function extractStorageFromPage(playUrl, sessionCookie) {
 }
 
 /**
- * Calls LookMovie's access API endpoint to get direct stream URLs and subtitles.
+ * Builds short diagnostic badge for stream title display (visible on Android TV Test Results).
  */
-function fetchAccessStreams(domain, storageData, seasonNum, episodeNum, sessionCookie, refererUrl) {
+function buildShortBadge(mirrorHost, diag) {
+    if (!diag) return "[" + mirrorHost + "]";
+    switch (diag.authStatus) {
+        case "SUCCESS":
+            return "[" + mirrorHost + " | ✅ Logged In]";
+        case "GUEST_NO_CREDS":
+            return "[" + mirrorHost + " | ⚠️ Guest: No login]";
+        case "BAD_CREDS":
+            return "[" + mirrorHost + " | ❌ Login failed: Wrong password]";
+        case "CAPTCHA":
+            return "[" + mirrorHost + " | ❌ Login failed: reCAPTCHA]";
+        case "COOKIE_ACTIVE":
+            return "[" + mirrorHost + " | 🔑 Session Cookie]";
+        case "HTTP_ERROR":
+            return "[" + mirrorHost + " | ❌ Login failed: HTTP error]";
+        case "NETWORK_ERROR":
+            return "[" + mirrorHost + " | ❌ Login failed: Network error]";
+        default:
+            return "[" + mirrorHost + " | " + diag.authStatus + "]";
+    }
+}
+
+/**
+ * Calls LookMovie's access API endpoint to get direct stream URLs and subtitles.
+ * Injects detailed diagnostic badges into stream.title and stream.name.
+ */
+function fetchAccessStreams(domain, storageData, seasonNum, episodeNum, sessionCookie, refererUrl, diag) {
     var apiUrl;
     var params = [];
 
@@ -456,7 +614,7 @@ function fetchAccessStreams(domain, storageData, seasonNum, episodeNum, sessionC
 
     return requestJson(fullUrl, { headers: headers }).then(function(json) {
         if (!json || !json.streams) {
-            console.warn("[LookMovie2] No streams in access API response:", json);
+            console.warn("[LookMovie2 Diagnostics] No streams returned by access API on " + domain, json);
             return [];
         }
 
@@ -496,7 +654,7 @@ function fetchAccessStreams(domain, storageData, seasonNum, episodeNum, sessionC
             });
         }
 
-        // Sort by quality priority
+        // Sort by quality priority (2160p -> 1080p -> 720p -> 480p)
         var qualityPriority = ["2160p", "1080p", "720p", "480p", "360p", "auto"];
         parsedQualities.sort(function(a, b) {
             var idxA = qualityPriority.indexOf(a.normQual);
@@ -506,7 +664,10 @@ function fetchAccessStreams(domain, storageData, seasonNum, episodeNum, sessionC
             return idxA - idxB;
         });
 
+        var host = getHostName(domain);
+        var badge = buildShortBadge(host, diag);
         var results = [];
+
         for (var q = 0; q < parsedQualities.length; q++) {
             var item = parsedQualities[q];
             var qualLabel = item.normQual.toUpperCase();
@@ -519,9 +680,13 @@ function fetchAccessStreams(domain, storageData, seasonNum, episodeNum, sessionC
                                "E" + (episodeNum < 10 ? "0" + episodeNum : episodeNum);
             }
 
+            // Append diagnostic indicator directly into stream.title for instant visibility in Nuvio
+            var fullTitle = streamTitle + " • " + badge;
+            var fullName = "LookMovie2 - " + qualLabel + " [Site: " + host + " • " + (diag ? diag.authMessage : "OK") + "]";
+
             results.push({
-                name: "LookMovie2 - " + qualLabel,
-                title: streamTitle,
+                name: fullName,
+                title: fullTitle,
                 url: item.url,
                 quality: item.normQual,
                 size: "Unknown",
@@ -543,24 +708,42 @@ function fetchAccessStreams(domain, storageData, seasonNum, episodeNum, sessionC
  * If a mirror produces only guest (480p) streams due to login failure, continues trying
  * subsequent mirrors to find 1080p/720p, falling back to the guest streams if needed.
  */
-function tryScrapeWithMirrors(mirrors, index, meta, seasonNum, episodeNum, settings, guestFallback) {
+function tryScrapeWithMirrors(mirrors, index, meta, seasonNum, episodeNum, settings, guestFallback, diag) {
     if (index >= mirrors.length) {
         if (guestFallback && guestFallback.length > 0) {
-            console.log("[LookMovie2] Returning guest fallback streams");
+            console.log("[LookMovie2 Diagnostics] Returning guest fallback streams (no mirror returned HD)");
             return Promise.resolve(guestFallback);
         }
-        console.warn("[LookMovie2] All mirrors exhausted for:", meta.title);
-        return Promise.resolve([]);
+        console.warn("[LookMovie2 Diagnostics] All mirrors exhausted for:", meta.title);
+        
+        // Return a diagnostic fallback item so the user sees the exact failure cause in Nuvio Test Results
+        var triedHosts = [];
+        for (var t = 0; t < mirrors.length; t++) {
+            triedHosts.push(getHostName(mirrors[t]));
+        }
+        var failHost = diag.activeMirror ? getHostName(diag.activeMirror) : triedHosts.join(", ");
+        var failReason = diag.authMessage || "No streams found across candidate mirrors";
+
+        return Promise.resolve([{
+            title: "[Diagnostics] ❌ No streams • " + failHost,
+            name: "LookMovie2: " + failReason + " (Tried: " + triedHosts.join(", ") + ")",
+            quality: "ERROR",
+            size: "N/A",
+            url: "about:diagnostics",
+            provider: "lookmovie2"
+        }]);
     }
 
     var domain = normalizeDomain(mirrors[index]);
     if (!domain) {
-        return tryScrapeWithMirrors(mirrors, index + 1, meta, seasonNum, episodeNum, settings, guestFallback);
+        return tryScrapeWithMirrors(mirrors, index + 1, meta, seasonNum, episodeNum, settings, guestFallback, diag);
     }
 
-    console.log("[LookMovie2] Trying mirror (" + (index + 1) + "/" + mirrors.length + "):", domain);
+    console.log("[LookMovie2 Diagnostics] Trying mirror (" + (index + 1) + "/" + mirrors.length + "): " + domain);
+    diag.activeMirror = domain;
+    diag.triedMirrors.push(domain);
 
-    return loginLookMovie(domain, settings.email, settings.password, settings.cookie).then(function(sessionCookie) {
+    return loginLookMovie(domain, settings.email, settings.password, settings.cookie, diag).then(function(sessionCookie) {
         return searchLookMovie(domain, meta.title, meta.year, meta.mediaType, sessionCookie).then(function(candidate) {
             if (!candidate || !candidate.href) {
                 if (meta.title && meta.title.toLowerCase().startsWith("the ")) {
@@ -572,21 +755,21 @@ function tryScrapeWithMirrors(mirrors, index, meta, seasonNum, episodeNum, setti
             return candidate;
         }).then(function(candidate) {
             if (!candidate || !candidate.href) {
-                console.log("[LookMovie2] No match on mirror " + domain + " for " + meta.title);
-                return tryScrapeWithMirrors(mirrors, index + 1, meta, seasonNum, episodeNum, settings, guestFallback);
+                console.log("[LookMovie2 Diagnostics] No search match on mirror " + domain + " for " + meta.title);
+                return tryScrapeWithMirrors(mirrors, index + 1, meta, seasonNum, episodeNum, settings, guestFallback, diag);
             }
 
             var playUrl = candidate.href
                 .replace("/movies/view/", "/movies/play/")
                 .replace("/shows/view/", "/shows/play/");
 
-            console.log("[LookMovie2] Fetching storage metadata from:", playUrl);
+            console.log("[LookMovie2 Diagnostics] Fetching storage metadata from: " + playUrl);
 
             return extractStorageFromPage(playUrl, sessionCookie).then(function(storage) {
-                return fetchAccessStreams(domain, storage, seasonNum, episodeNum, sessionCookie, playUrl);
+                diag.storageFound = true;
+                return fetchAccessStreams(domain, storage, seasonNum, episodeNum, sessionCookie, playUrl, diag);
             }).then(function(streams) {
                 if (streams && streams.length > 0) {
-                    // Check if high definition streams (1080p or 720p) are present
                     var hasHd = false;
                     for (var i = 0; i < streams.length; i++) {
                         if (streams[i].quality === "1080p" || streams[i].quality === "720p") {
@@ -595,21 +778,34 @@ function tryScrapeWithMirrors(mirrors, index, meta, seasonNum, episodeNum, setti
                         }
                     }
 
-                    if (hasHd || !sessionCookie) {
-                        if (hasHd) return streams;
-                        // If only 480p was returned and we're not authenticated on this mirror,
-                        // remember these streams and try next mirror for HD
-                        if (!guestFallback) guestFallback = streams;
-                        return tryScrapeWithMirrors(mirrors, index + 1, meta, seasonNum, episodeNum, settings, guestFallback);
+                    // If we have HD streams, return immediately
+                    if (hasHd) return streams;
+
+                    // If user has NO credentials configured, guest 480p is the maximum available on ANY mirror.
+                    // Return immediately to avoid slow timeouts on fallback mirrors!
+                    var hasUserCredentials = (settings.email && settings.password) || settings.cookie;
+                    if (!hasUserCredentials) {
+                        return streams;
                     }
-                    return streams;
+
+                    // If credentials failed due to BAD_CREDS (wrong password confirmed by LookMovie server),
+                    // all mirrors share the same account database. Return immediately with diagnostic failure badge:
+                    if (diag && diag.authStatus === "BAD_CREDS") {
+                        console.log("[LookMovie2 Diagnostics] Returning guest stream with bad credentials diagnostic");
+                        return streams;
+                    }
+
+                    // If credentials were provided but mirror was blocked by CAPTCHA/Cloudflare,
+                    // save as guest fallback and try subsequent mirrors for HD:
+                    if (!guestFallback) guestFallback = streams;
+                    return tryScrapeWithMirrors(mirrors, index + 1, meta, seasonNum, episodeNum, settings, guestFallback, diag);
                 }
-                return tryScrapeWithMirrors(mirrors, index + 1, meta, seasonNum, episodeNum, settings, guestFallback);
+                return tryScrapeWithMirrors(mirrors, index + 1, meta, seasonNum, episodeNum, settings, guestFallback, diag);
             });
         });
     }).catch(function(err) {
-        console.warn("[LookMovie2] Mirror " + domain + " failed (" + (err.message || err) + "), trying next...");
-        return tryScrapeWithMirrors(mirrors, index + 1, meta, seasonNum, episodeNum, settings, guestFallback);
+        console.warn("[LookMovie2 Diagnostics] Mirror " + domain + " failed (" + (err.message || err) + "), trying next...");
+        return tryScrapeWithMirrors(mirrors, index + 1, meta, seasonNum, episodeNum, settings, guestFallback, diag);
     });
 }
 
@@ -624,41 +820,61 @@ function tryScrapeWithMirrors(mirrors, index, meta, seasonNum, episodeNum, setti
  */
 function getStreams(tmdbId, mediaType, seasonNum, episodeNum) {
     var settings = getSettings();
+    var diag = createDiagnosticState();
 
-    console.log("[LookMovie2] Getting streams for media ID:", tmdbId, "type:", mediaType, "S:", seasonNum, "E:", episodeNum);
+    console.log("[LookMovie2 Diagnostics] Starting getStreams for media ID:", tmdbId, "type:", mediaType, "S:", seasonNum, "E:", episodeNum);
+    console.log("[LookMovie2 Diagnostics] Active settings: domain=" + settings.domain + ", email=" + (settings.email ? maskEmail(settings.email) : "(none)") + ", cookie=" + (settings.cookie ? "provided" : "(none)"));
 
     return getTmdbMetadata(tmdbId, mediaType).then(function(meta) {
         if (!meta.title) {
-            console.error("[LookMovie2] Could not resolve title from media ID:", tmdbId);
-            return [];
+            console.error("[LookMovie2 Diagnostics] Could not resolve title from media ID:", tmdbId);
+            return [{
+                title: "[Diagnostics] ❌ TMDB title lookup failed for ID " + tmdbId,
+                name: "LookMovie2: Could not resolve title from TMDB API",
+                quality: "ERROR",
+                size: "N/A",
+                url: "about:diagnostics",
+                provider: "lookmovie2"
+            }];
         }
 
-        console.log("[LookMovie2] Resolved media title:", meta.title, "(" + meta.year + ")");
+        console.log("[LookMovie2 Diagnostics] Resolved media title: \"" + meta.title + "\" (" + meta.year + ")");
 
-        // Build list of mirrors starting with configured domain
-        var mirrorList = [settings.domain];
-        var fallbackMirrors = [
-            "https://www.lookmovie2.to",
+        // Prioritized list of responsive mirrors
+        var mirrorList = [];
+        var configuredDomain = normalizeDomain(settings.domain);
+        mirrorList.push(configuredDomain);
+
+        var candidateMirrors = [
             "https://lookmovie2.la",
+            "https://www.lookmovie2.to",
             "https://lookmovie.ag",
-            "https://lookmovie.foundation"
+            "https://lookmovie.foundation",
+            "https://lookmovie.io"
         ];
-        for (var m = 0; m < fallbackMirrors.length; m++) {
-            var norm = normalizeDomain(fallbackMirrors[m]);
+        for (var m = 0; m < candidateMirrors.length; m++) {
+            var norm = normalizeDomain(candidateMirrors[m]);
             if (mirrorList.indexOf(norm) === -1) {
                 mirrorList.push(norm);
             }
         }
 
-        return tryScrapeWithMirrors(mirrorList, 0, meta, seasonNum, episodeNum, settings, null);
+        return tryScrapeWithMirrors(mirrorList, 0, meta, seasonNum, episodeNum, settings, null, diag);
     }).catch(function(err) {
-        console.error("[LookMovie2] Scraper error:", err && err.message ? err.message : err);
-        return [];
+        console.error("[LookMovie2 Diagnostics] Scraper error:", err && err.message ? err.message : err);
+        return [{
+            title: "[Diagnostics] ❌ Scraper error: " + (err && err.message ? err.message : err),
+            name: "LookMovie2 Error: " + (err && err.message ? err.message : err),
+            quality: "ERROR",
+            size: "N/A",
+            url: "about:diagnostics",
+            provider: "lookmovie2"
+        }];
     });
 }
 
 /**
- * Defines settings layout for Nuvio settings modal.
+ * Defines settings layout for Nuvio settings modal (desktop / mobile).
  */
 function onSettings() {
     return Promise.resolve([
@@ -674,8 +890,8 @@ function onSettings() {
             type: "text",
             key: "domain",
             label: "LookMovie Domain",
-            placeholder: "https://www.lookmovie2.to",
-            description: "Active LookMovie domain or mirror (default: https://www.lookmovie2.to)"
+            placeholder: "https://lookmovie2.la",
+            description: "Active LookMovie domain or mirror (default: https://lookmovie2.la)"
         },
         {
             type: "text",
@@ -697,7 +913,7 @@ function onSettings() {
             key: "cookie",
             label: "Session Cookie (PHPSESSID)",
             placeholder: "e.g. 46ge6ted71ufjgqrb1smc4sab6",
-            description: "Optional: Paste your LookMovie PHPSESSID cookie to bypass login forms completely"
+            description: "Optional: Paste your LookMovie PHPSESSID cookie to bypass login forms and CAPTCHAs completely"
         },
         {
             type: "select",
