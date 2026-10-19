@@ -800,6 +800,31 @@ function tryScrapeWithMirrors(mirrors, index, meta, seasonNum, episodeNum, setti
                     // If we have HD streams, return immediately
                     if (hasHd) return streams;
 
+                    // If user had a custom cookie configured, but it failed to yield HD (e.g. cookie expired),
+                    // AND email & password are configured, attempt login with credentials to unlock HD:
+                    if (settings.cookie && settings.email && settings.password && !diag._cookieTriedCreds) {
+                        diag._cookieTriedCreds = true;
+                        console.log("[LookMovie2 Diagnostics] Cookie did not return HD streams, attempting login with account credentials...");
+                        return loginLookMovie(domain, settings.email, settings.password, "", diag).then(function(credCookie) {
+                            if (credCookie && credCookie !== sessionCookie) {
+                                return fetchAccessStreams(domain, storage, seasonNum, episodeNum, credCookie, playUrl, diag).then(function(newStreams) {
+                                    if (newStreams && newStreams.length > 0) {
+                                        var newHasHd = false;
+                                        for (var j = 0; j < newStreams.length; j++) {
+                                            if (newStreams[j].quality === "1080p" || newStreams[j].quality === "720p") {
+                                                newHasHd = true;
+                                                break;
+                                            }
+                                        }
+                                        if (newHasHd) return newStreams;
+                                    }
+                                    return streams;
+                                });
+                            }
+                            return streams;
+                        });
+                    }
+
                     // If user has NO credentials configured, guest 480p is the maximum available on ANY mirror.
                     // Return immediately to avoid slow timeouts on fallback mirrors!
                     var hasUserCredentials = (settings.email && settings.password) || settings.cookie;
