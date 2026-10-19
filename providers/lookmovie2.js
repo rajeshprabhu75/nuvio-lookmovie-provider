@@ -83,7 +83,10 @@ function createDiagnosticState() {
         authStatus: "UNKNOWN",       // "SUCCESS" | "GUEST_NO_CREDS" | "BAD_CREDS" | "CAPTCHA" | "HTTP_ERROR" | "COOKIE_ACTIVE" | "NETWORK_ERROR"
         authMessage: "Checking status...",
         storageFound: false,
-        qualitiesFound: []
+        qualitiesFound: [],
+        networkErrors: [],
+        searchedMirrors: 0,
+        searchFound: false
     };
 }
 
@@ -722,7 +725,21 @@ function tryScrapeWithMirrors(mirrors, index, meta, seasonNum, episodeNum, setti
             triedHosts.push(getHostName(mirrors[t]));
         }
         var failHost = diag.activeMirror ? getHostName(diag.activeMirror) : triedHosts.join(", ");
-        var failReason = diag.authMessage || "No streams found across candidate mirrors";
+
+        var failReason;
+        if (diag.networkErrors && diag.networkErrors.length >= mirrors.length) {
+            failReason = "ISP / DNS Block: All mirrors unreachable (Enable VPN on device)";
+        } else if (diag.authStatus === "BAD_CREDS") {
+            failReason = diag.authMessage;
+        } else if (diag.authStatus === "CAPTCHA") {
+            failReason = diag.authMessage;
+        } else if (diag.searchedMirrors > 0 && !diag.searchFound) {
+            failReason = "Title not found on LookMovie";
+        } else if (diag.storageFound) {
+            failReason = "No playable stream links found for this title";
+        } else {
+            failReason = "No streams found across candidate mirrors (Check VPN / ISP block)";
+        }
 
         return Promise.resolve([{
             title: "[Diagnostics] ❌ No streams • " + failHost,
@@ -745,6 +762,7 @@ function tryScrapeWithMirrors(mirrors, index, meta, seasonNum, episodeNum, setti
 
     return loginLookMovie(domain, settings.email, settings.password, settings.cookie, diag).then(function(sessionCookie) {
         return searchLookMovie(domain, meta.title, meta.year, meta.mediaType, sessionCookie).then(function(candidate) {
+            diag.searchedMirrors = (diag.searchedMirrors || 0) + 1;
             if (!candidate || !candidate.href) {
                 if (meta.title && meta.title.toLowerCase().startsWith("the ")) {
                     var stripped = meta.title.slice(4).trim();
@@ -758,6 +776,7 @@ function tryScrapeWithMirrors(mirrors, index, meta, seasonNum, episodeNum, setti
                 console.log("[LookMovie2 Diagnostics] No search match on mirror " + domain + " for " + meta.title);
                 return tryScrapeWithMirrors(mirrors, index + 1, meta, seasonNum, episodeNum, settings, guestFallback, diag);
             }
+            diag.searchFound = true;
 
             var playUrl = candidate.href
                 .replace("/movies/view/", "/movies/play/")
@@ -804,7 +823,12 @@ function tryScrapeWithMirrors(mirrors, index, meta, seasonNum, episodeNum, setti
             });
         });
     }).catch(function(err) {
-        console.warn("[LookMovie2 Diagnostics] Mirror " + domain + " failed (" + (err.message || err) + "), trying next...");
+        var errMsg = (err && err.message) ? err.message : String(err);
+        console.warn("[LookMovie2 Diagnostics] Mirror " + domain + " failed (" + errMsg + "), trying next...");
+        if (diag) {
+            diag.networkErrors = diag.networkErrors || [];
+            diag.networkErrors.push({ domain: domain, error: errMsg });
+        }
         return tryScrapeWithMirrors(mirrors, index + 1, meta, seasonNum, episodeNum, settings, guestFallback, diag);
     });
 }
