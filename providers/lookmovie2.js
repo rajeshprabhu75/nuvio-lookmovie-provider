@@ -12,7 +12,7 @@
  * Complies with Nuvio's Promise-based QuickJS sandbox specification.
  */
 
-var DEFAULT_DOMAIN = "https://lookmovie2.la";
+var DEFAULT_DOMAIN = "https://www.lookmovie2.to";
 var FALLBACK_TMDB_KEY = "439c478a771f35c05022f9feabcca01c";
 var DEFAULT_USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36";
 
@@ -25,7 +25,7 @@ var DEFAULT_USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/
 var TV_FALLBACK_CREDENTIALS = {
     email: "",      // e.g. "your_email@example.com"
     password: "",   // e.g. "your_password"
-    cookie: ""      // e.g. "PHPSESSID=46ge6ted71ufjgqrb1smc4sab6" (bypasses login and CAPTCHAs)
+    cookie: "nk60c9e9bsaopouivnjjiij3o9h"      // e.g. "PHPSESSID=46ge6ted71ufjgqrb1smc4sab6" (bypasses login and CAPTCHAs)
 };
 
 /**
@@ -988,8 +988,8 @@ function getStreams(tmdbId, mediaType, seasonNum, episodeNum) {
         mirrorList.push(configuredDomain);
 
         var candidateMirrors = [
-            "https://lookmovie2.la",
             "https://www.lookmovie2.to",
+            "https://lookmovie2.la",
             "https://lookmovie.ag",
             "https://lookmovie.foundation",
             "https://lookmovie.io"
