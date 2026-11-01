@@ -80,14 +80,41 @@ function createDiagnosticState() {
         activeMirror: "",
         triedMirrors: [],
         authType: "none",            // "cookie" | "credentials" | "none"
-        authStatus: "UNKNOWN",       // "SUCCESS" | "GUEST_NO_CREDS" | "BAD_CREDS" | "CAPTCHA" | "HTTP_ERROR" | "COOKIE_ACTIVE" | "NETWORK_ERROR"
+        authStatus: "UNKNOWN",       // "SUCCESS" | "FREE_TIER" | "GUEST_NO_CREDS" | "BAD_CREDS" | "CAPTCHA" | "HTTP_ERROR" | "COOKIE_ACTIVE" | "NETWORK_ERROR"
         authMessage: "Checking status...",
+        userEmail: "",
         storageFound: false,
         qualitiesFound: [],
         networkErrors: [],
         searchedMirrors: 0,
         searchFound: false
     };
+}
+
+/**
+ * Normalizes user-provided or header cookie string to ensure proper Cookie header format.
+ * Handles:
+ * - Bare session ID: "nk60c9e9bsaopouivnjjiij3o9h" -> "PHPSESSID=nk60c9e9bsaopouivnjjiij3o9h;"
+ * - Formatted cookie: "PHPSESSID=nk60c9e9bsaopouivnjjiij3o9h" -> "PHPSESSID=nk60c9e9bsaopouivnjjiij3o9h;"
+ * - Multi-cookie strings: "PHPSESSID=...; _identity=...; _csrf=..." -> preserved and formatted cleanly
+ */
+function normalizeCookieString(cookieStr) {
+    if (!cookieStr || typeof cookieStr !== "string") return "";
+    var s = cookieStr.trim().replace(/^Cookie:\s*/i, "").replace(/["']/g, "").trim();
+    if (!s) return "";
+    if (s.indexOf("=") === -1) {
+        return "PHPSESSID=" + s + ";";
+    }
+    var parts = s.split(";");
+    var valid = [];
+    for (var i = 0; i < parts.length; i++) {
+        var p = parts[i].trim();
+        if (p && p.indexOf("=") !== -1) {
+            valid.push(p);
+        }
+    }
+    if (valid.length === 0) return "";
+    return valid.join("; ") + ";";
 }
 
 /**
@@ -107,7 +134,7 @@ function getSettings() {
         domain: domain,
         email: email,
         password: password,
-        cookie: cookie,
+        cookie: normalizeCookieString(cookie),
         preferredQuality: s.preferredQuality || "All"
     };
 }
@@ -208,21 +235,51 @@ var sessionCache = {
 };
 
 /**
+ * Extracts key-value pairs from Set-Cookie headers into a map.
+ */
+function extractCookiesMap(cookieHeader, existing) {
+    var jar = Object.assign({}, existing || {});
+    if (!cookieHeader || typeof cookieHeader !== "string") return jar;
+    var regex = /([^=;\s]+)=([^;,\s]+)/g;
+    var m;
+    while ((m = regex.exec(cookieHeader)) !== null) {
+        var k = m[1].trim();
+        var v = m[2].trim();
+        var lowerK = k.toLowerCase();
+        if (lowerK !== "path" && lowerK !== "domain" && lowerK !== "expires" && lowerK !== "samesite" && lowerK !== "max-age" && lowerK !== "priority") {
+            jar[k] = v;
+        }
+    }
+    return jar;
+}
+
+/**
+ * Serializes cookie map into a valid Cookie request header string.
+ */
+function cookieMapToString(jar) {
+    var out = [];
+    for (var k in jar) {
+        if (jar.hasOwnProperty(k) && jar[k]) {
+            out.push(k + "=" + jar[k]);
+        }
+    }
+    return out.length > 0 ? out.join("; ") + ";" : "";
+}
+
+/**
  * Authenticates with LookMovie account to unlock 1080p & 720p streams.
  * Records precise diagnostic status and reasons (bad credentials, CAPTCHA, etc.).
  */
 function loginLookMovie(domain, email, password, customCookie, diag) {
-    if (customCookie) {
-        var cleanCookie = customCookie.replace(/^PHPSESSID=/, "").replace(/;$/, "").trim();
-        if (cleanCookie) {
-            console.log("[LookMovie2 Diagnostics] Using user-provided session cookie");
-            if (diag) {
-                diag.authType = "cookie";
-                diag.authStatus = "COOKIE_ACTIVE";
-                diag.authMessage = "Using custom session cookie (PHPSESSID)";
-            }
-            return Promise.resolve("PHPSESSID=" + cleanCookie + ";");
+    var normCookie = normalizeCookieString(customCookie);
+    if (normCookie) {
+        console.log("[LookMovie2 Diagnostics] Using user-provided session cookie");
+        if (diag) {
+            diag.authType = "cookie";
+            diag.authStatus = "COOKIE_ACTIVE";
+            diag.authMessage = "Using custom session cookie";
         }
+        return Promise.resolve(normCookie);
     }
 
     if (!email || !password) {
@@ -237,6 +294,7 @@ function loginLookMovie(domain, email, password, customCookie, diag) {
 
     if (diag) {
         diag.authType = "credentials";
+        diag.userEmail = email;
     }
     domain = normalizeDomain(domain);
 
@@ -271,13 +329,8 @@ function loginLookMovie(domain, email, password, customCookie, diag) {
             return "";
         }
 
-        var rawCookie = res.headers.get("set-cookie") || "";
-        var sessMatch = rawCookie.match(/PHPSESSID=([^;,\s]+)/);
-        var csrfCookieMatch = rawCookie.match(/_csrf=([^;,\s]+)/);
-
-        var initialCookies = "";
-        if (sessMatch) initialCookies += "PHPSESSID=" + sessMatch[1] + "; ";
-        if (csrfCookieMatch) initialCookies += "_csrf=" + csrfCookieMatch[1] + "; ";
+        var cookieJar = extractCookiesMap(res.headers.get("set-cookie"), {});
+        var initialCookies = cookieMapToString(cookieJar);
 
         return res.text().then(function(html) {
             var csrfTokenMatch = html.match(/name="_csrf"\s+value="([^"]+)"/) || html.match(/name="csrf-token"\s+content="([^"]+)"/);
@@ -309,8 +362,7 @@ function loginLookMovie(domain, email, password, customCookie, diag) {
                 body: postBody,
                 redirect: "manual"
             }).then(function(postRes) {
-                var postCookies = postRes.headers.get("set-cookie") || "";
-                var postSessMatch = postCookies.match(/PHPSESSID=([^;,\s]+)/);
+                cookieJar = extractCookiesMap(postRes.headers.get("set-cookie"), cookieJar);
                 var locationHeader = postRes.headers.get("location") || "";
                 var finalUrl = postRes.url || "";
                 var isLoginSuccess = false;
@@ -323,19 +375,21 @@ function loginLookMovie(domain, email, password, customCookie, diag) {
                 }
 
                 if (isLoginSuccess) {
-                    var finalCookieId = postSessMatch ? postSessMatch[1] : (sessMatch ? sessMatch[1] : "");
-                    if (finalCookieId) {
-                        var authCookie = "PHPSESSID=" + finalCookieId + ";";
+                    var authCookie = cookieMapToString(cookieJar);
+                    if (!authCookie && cookieJar.PHPSESSID) {
+                        authCookie = "PHPSESSID=" + cookieJar.PHPSESSID + ";";
+                    }
+                    if (authCookie) {
                         sessionCache = {
                             domain: domain,
                             email: email,
                             cookie: authCookie,
                             timestamp: Date.now()
                         };
-                        console.log("[LookMovie2 Diagnostics] Login successful on " + domain + "! HD 1080p/720p unlocked");
+                        console.log("[LookMovie2 Diagnostics] Login handshake successful on " + domain + " (" + maskEmail(email) + ")");
                         if (diag) {
                             diag.authStatus = "SUCCESS";
-                            diag.authMessage = "Logged In: HD unlocked (" + maskEmail(email) + ")";
+                            diag.authMessage = "Logged In (" + maskEmail(email) + ")";
                         }
                         return authCookie;
                     }
@@ -548,7 +602,9 @@ function buildShortBadge(mirrorHost, diag) {
     if (!diag) return "[" + mirrorHost + "]";
     switch (diag.authStatus) {
         case "SUCCESS":
-            return "[" + mirrorHost + " | ✅ Logged In]";
+            return "[" + mirrorHost + " | ✅ Premium HD]";
+        case "FREE_TIER":
+            return "[" + mirrorHost + " | ⚠️ Free Tier (480p only)]";
         case "GUEST_NO_CREDS":
             return "[" + mirrorHost + " | ⚠️ Guest: No login]";
         case "BAD_CREDS":
@@ -666,6 +722,36 @@ function fetchAccessStreams(domain, storageData, seasonNum, episodeNum, sessionC
             if (idxB === -1) idxB = 99;
             return idxA - idxB;
         });
+
+        // Determine if HD streams (1080p, 720p, 2160p) are unlocked
+        var hasHd = false;
+        for (var p = 0; p < parsedQualities.length; p++) {
+            if (parsedQualities[p].normQual === "1080p" || parsedQualities[p].normQual === "720p" || parsedQualities[p].normQual === "2160p") {
+                hasHd = true;
+                break;
+            }
+        }
+
+        if (diag) {
+            if (hasHd) {
+                if (diag.authType === "credentials") {
+                    diag.authStatus = "SUCCESS";
+                    diag.authMessage = "Logged In: HD Unlocked (" + maskEmail(diag.userEmail || "") + ")";
+                } else if (diag.authType === "cookie") {
+                    diag.authStatus = "COOKIE_ACTIVE";
+                    diag.authMessage = "Session Cookie: HD Unlocked";
+                }
+            } else {
+                // Only 480p/360p SD returned by LookMovie
+                if (diag.authType === "credentials" && (diag.authStatus === "SUCCESS" || diag.authStatus === "FREE_TIER")) {
+                    diag.authStatus = "FREE_TIER";
+                    diag.authMessage = "Logged In (Free Tier: 480p only • Premium required for 1080p/720p)";
+                } else if (diag.authType === "cookie" && (diag.authStatus === "COOKIE_ACTIVE" || diag.authStatus === "FREE_TIER")) {
+                    diag.authStatus = "FREE_TIER";
+                    diag.authMessage = "Session Cookie Active (Free Tier: 480p only • Premium required for 1080p/720p)";
+                }
+            }
+        }
 
         var host = getHostName(domain);
         var badge = buildShortBadge(host, diag);
@@ -839,6 +925,13 @@ function tryScrapeWithMirrors(mirrors, index, meta, seasonNum, episodeNum, setti
                         return streams;
                     }
 
+                    // If account is confirmed as Free Tier (server explicitly only returned 480p),
+                    // all mirrors share the same account tier. Return immediately to avoid unnecessary mirror timeouts:
+                    if (diag && diag.authStatus === "FREE_TIER") {
+                        console.log("[LookMovie2 Diagnostics] Account verified as Free Tier (480p only). Returning stream without probing other mirrors.");
+                        return streams;
+                    }
+
                     // If credentials were provided but mirror was blocked by CAPTCHA/Cloudflare,
                     // save as guest fallback and try subsequent mirrors for HD:
                     if (!guestFallback) guestFallback = streams;
@@ -984,7 +1077,11 @@ function onSettings() {
 if (typeof module !== "undefined" && module.exports) {
     module.exports = {
         getStreams: getStreams,
-        onSettings: onSettings
+        onSettings: onSettings,
+        normalizeCookieString: normalizeCookieString,
+        extractCookiesMap: extractCookiesMap,
+        cookieMapToString: cookieMapToString,
+        buildShortBadge: buildShortBadge
     };
 }
 if (typeof globalThis !== "undefined") {

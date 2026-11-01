@@ -183,4 +183,34 @@ assert.strictEqual(streams[0].subtitles.length, 2);
 assert.strictEqual(streams[0].subtitles[0].url, "https://lookmovie2.la/subtitles/12345/en.vtt");
 console.log(" Stream result formatting passed!");
 
+// 5. Test Cookie Normalization & Free Tier Diagnostics
+console.log("Testing cookie normalization & diagnostics...");
+const { normalizeCookieString, extractCookiesMap, cookieMapToString, buildShortBadge } = require("./providers/lookmovie2.js");
+
+// Bare session ID (like from Firefox screenshot)
+const bare = normalizeCookieString("nk60c9e9bsaopouivnjjiij3o9h");
+assert.strictEqual(bare, "PHPSESSID=nk60c9e9bsaopouivnjjiij3o9h;");
+
+// Formatted cookie
+const single = normalizeCookieString("PHPSESSID=nk60c9e9bsaopouivnjjiij3o9h");
+assert.strictEqual(single, "PHPSESSID=nk60c9e9bsaopouivnjjiij3o9h;");
+
+// Multi-cookie string with _identity
+const multi = normalizeCookieString("PHPSESSID=nk60c9e9bsaopouivnjjiij3o9h; _csrf=fa9ea681843; _identity=userToken123;");
+assert(multi.includes("PHPSESSID=nk60c9e9bsaopouivnjjiij3o9h"));
+assert(multi.includes("_identity=userToken123"));
+
+// Header cookie extraction map
+const sampleHeader = "PHPSESSID=sess123; path=/; HttpOnly, _identity=id456; path=/; HttpOnly";
+const jar = extractCookiesMap(sampleHeader);
+assert.strictEqual(jar.PHPSESSID, "sess123");
+assert.strictEqual(jar._identity, "id456");
+
+// Diagnostic badges
+assert.strictEqual(buildShortBadge("lookmovie2.la", { authStatus: "FREE_TIER" }), "[lookmovie2.la | ⚠️ Free Tier (480p only)]");
+assert.strictEqual(buildShortBadge("lookmovie2.la", { authStatus: "SUCCESS" }), "[lookmovie2.la | ✅ Premium HD]");
+assert.strictEqual(buildShortBadge("lookmovie2.la", { authStatus: "GUEST_NO_CREDS" }), "[lookmovie2.la | ⚠️ Guest: No login]");
+console.log(" Cookie normalization & Free Tier diagnostics passed!");
+
 console.log("\nALL UNIT TESTS PASSED SUCCESSFULLY! \n");
+
