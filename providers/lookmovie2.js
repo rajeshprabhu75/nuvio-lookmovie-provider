@@ -25,7 +25,7 @@ var DEFAULT_USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/
 var TV_FALLBACK_CREDENTIALS = {
     email: "",      // e.g. "your_email@example.com"
     password: "",   // e.g. "your_password"
-    cookie: "nk60c9e9bsaopouivnjjiij3o9h"      // e.g. "PHPSESSID=46ge6ted71ufjgqrb1smc4sab6" (bypasses login and CAPTCHAs)
+    cookie: "PHPSESSID=nk60c9e9bsaopuivnjjiij3o9h; _csrf=fa9ea6a6818431894ba0db8643d4a214807c55f411bb276b985c689098d62107a%3A2%3A%7Bi%3A0%3Bs%3A5%3A%22_csrf%22%3Bi%3A1%3Bs%3A32%3A%22Ho3eCcwWlVqbaE8k2ONWESeuuryIThpr%22%3B%7D;"
 };
 
 /**

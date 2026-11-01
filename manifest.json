@@ -1,12 +1,12 @@
 {
   "name": "LookMovie2 Provider Repo",
-  "version": "1.0.8",
+  "version": "1.0.9",
   "scrapers": [
     {
       "id": "lookmovie2",
       "name": "LookMovie2",
       "description": "Stream movies and TV series directly from LookMovie2 with real-time connection diagnostics, auth status indicators, and mirror failover.",
-      "version": "1.0.8",
+      "version": "1.0.9",
       "author": "Nuvio Community",
       "supportedTypes": [
         "movie",
